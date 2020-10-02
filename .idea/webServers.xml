@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="df35c16b-4c80-45ad-8321-1f592243c099" name="curie">
+        <fileTransfer rootFolder="/playpen-ssd/tenghao" accessType="SFTP" host="curie.cs.unc.edu" port="22" sshConfigId="fac6bb84-71df-49a3-b302-5fcbabecba58" sshConfig="tenghao@curie.cs.unc.edu:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

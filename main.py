@@ -66,6 +66,13 @@ parser.add_argument('--data_split', type=str, default='train')
 parser.add_argument('--fullwiki', action='store_true')
 parser.add_argument('--prediction_file', type=str)
 parser.add_argument('--sp_threshold', type=float, default=0.3)
+parser.add_argument('--top_k', type=float, default=0.)
+parser.add_argument('--top_p', type=float, default=0.9)
+parser.add_argument('--temperature', type=float, default=0.7)
+parser.add_argument('--decode_type', default= "topk")
+parser.add_argument('--min_len_sentence', type=float, default=5)
+parser.add_argument('--evaluate_batch_size', type=float, default=1)
+parser.add_argument('--drop_prob', type=float, default=0.3)
 
 config = parser.parse_args()
 

@@ -1,3 +1,5 @@
+import math
+
 import ujson as json
 import numpy as np
 from tqdm import tqdm
@@ -13,6 +15,7 @@ from util import get_buckets, DataIterator, IGNORE_INDEX
 import time
 import shutil
 import random
+import pickle
 import torch
 from torch.autograd import Variable
 import sys
@@ -72,24 +75,32 @@ def train(config):
     def build_dev_iterator():
         return DataIterator(dev_buckets, config.batch_size, config.para_limit, config.ques_limit, config.char_limit, False, config.sent_limit)
 
-    if config.sp_lambda > 0:
-        model = SPModel(config, word_mat, char_mat)
-    else:
-        model = Model(config, word_mat, char_mat)
+    # if config.sp_lambda > 0:
+    #     model = SPModel(config, word_mat, char_mat)
+    # else:
+    model = Model(config, word_mat, char_mat)
 
     logging('nparams {}'.format(sum([p.nelement() for p in model.parameters() if p.requires_grad])))
     ori_model = model.cuda()
     model = nn.DataParallel(ori_model)
 
     lr = config.init_lr
-    optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=config.init_lr)
-    cur_patience = 0
-    total_loss = 0
-    global_step = 0
-    best_dev_F1 = None
-    stop_train = False
-    start_time = time.time()
-    eval_start_time = time.time()
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(0.5))
+
+    num_trial = 0
+    train_iter = patience = cum_loss = report_loss = cum_tgt_words = report_tgt_words = 0
+    cum_examples = report_examples = epoch = valid_num = 0
+    hist_valid_scores = []
+    clip_grad = float(5.0)
+    train_time = begin_time = time.time()
+    # optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=config.init_lr)
+    # cur_patience = 0
+    # total_loss = 0
+    # global_step = 0
+    # best_dev_F1 = None
+    # stop_train = False
+    # start_time = time.time()
+    # eval_start_time = time.time()
     model.train()
 
     for epoch in range(10000):
@@ -99,6 +110,9 @@ def train(config):
             context_char_idxs = Variable(data['context_char_idxs'])
             ques_char_idxs = Variable(data['ques_char_idxs'])
             context_lens = Variable(data['context_lens'])
+
+            question_lens = Variable(data['question_lens'])
+
             y1 = Variable(data['y1'])
             y2 = Variable(data['y2'])
             q_type = Variable(data['q_type'])
@@ -107,54 +121,101 @@ def train(config):
             end_mapping = Variable(data['end_mapping'])
             all_mapping = Variable(data['all_mapping'])
 
-            logit1, logit2, predict_type, predict_support = model(context_idxs, ques_idxs, context_char_idxs, ques_char_idxs, context_lens, start_mapping, end_mapping, all_mapping, return_yp=False)
-            loss_1 = (nll_sum(predict_type, q_type) + nll_sum(logit1, y1) + nll_sum(logit2, y2)) / context_idxs.size(0)
-            loss_2 = nll_average(predict_support.view(-1, 2), is_support.view(-1))
-            loss = loss_1 + config.sp_lambda * loss_2
+            # logit1, logit2, predict_type, predict_support = model(context_idxs, ques_idxs, context_char_idxs, ques_char_idxs, context_lens, start_mapping, end_mapping, all_mapping,question_lens, return_yp=False)
+            # loss_1 = (nll_sum(predict_type, q_type) + nll_sum(logit1, y1) + nll_sum(logit2, y2)) / context_idxs.size(0)
+            # loss_2 = nll_average(predict_support.view(-1, 2), is_support.view(-1))
+            # loss = loss_1 + config.sp_lambda * loss_2
+            question_lens, indices = torch.sort(question_lens, descending=True)
 
+            ques_idxs = ques_idxs.cpu().detach().numpy()
+            indices = indices.data.cpu().numpy()
+            ques_idxs = torch.tensor(ques_idxs[indices], device='cuda:0')
+            train_iter += 1
             optimizer.zero_grad()
+            example_losses = -model(context_idxs, ques_idxs, context_char_idxs, ques_char_idxs, context_lens, question_lens,start_mapping, end_mapping, all_mapping)
+            batch_loss = example_losses.sum()
+            loss = batch_loss / config.batch_size
+
             loss.backward()
+            # clip gradient
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+
             optimizer.step()
 
-            total_loss += loss.data[0]
-            global_step += 1
+            batch_losses_val = batch_loss.item()
+            report_loss += batch_losses_val
+            cum_loss += batch_losses_val
 
-            if global_step % config.period == 0:
-                cur_loss = total_loss / config.period
-                elapsed = time.time() - start_time
-                logging('| epoch {:3d} | step {:6d} | lr {:05.5f} | ms/batch {:5.2f} | train loss {:8.3f}'.format(epoch, global_step, lr, elapsed*1000/config.period, cur_loss))
-                total_loss = 0
-                start_time = time.time()
+            tgt_words_num_to_predict = sum(len(s[1:]) for s in ques_idxs)  # omitting leading `<s>`
+            report_tgt_words += tgt_words_num_to_predict
+            cum_tgt_words += tgt_words_num_to_predict
+            report_examples += config.batch_size
+            cum_examples += config.batch_size
 
-            if global_step % config.checkpoint == 0:
-                model.eval()
-                metrics = evaluate_batch(build_dev_iterator(), model, 0, dev_eval_file, config)
-                model.train()
 
-                logging('-' * 89)
-                logging('| eval {:6d} in epoch {:3d} | time: {:5.2f}s | dev loss {:8.3f} | EM {:.4f} | F1 {:.4f}'.format(global_step//config.checkpoint,
-                    epoch, time.time()-eval_start_time, metrics['loss'], metrics['exact_match'], metrics['f1']))
-                logging('-' * 89)
+            if train_iter % 100 == 0:
+                print(report_loss)
+                print(report_examples)
+                print('epoch %d, iter %d, avg. loss %.2f, avg. ppl %.2f ' \
+                      'cum. examples %d, speed %.2f words/sec, time elapsed %.2f sec' % (epoch, train_iter,
+                                                                                         report_loss / report_examples,
+                                                                                         math.exp(report_loss / report_tgt_words),
+                                                                                         cum_examples,
+                                                                                         report_tgt_words / (time.time() - train_time),
+                                                                                         time.time() - begin_time), file=sys.stderr)
 
-                eval_start_time = time.time()
+                train_time = time.time()
+                report_loss = report_tgt_words = report_examples = 0.
 
-                dev_F1 = metrics['f1']
-                if best_dev_F1 is None or dev_F1 > best_dev_F1:
-                    best_dev_F1 = dev_F1
-                    torch.save(ori_model.state_dict(), os.path.join(config.save, 'model.pt'))
-                    cur_patience = 0
-                else:
-                    cur_patience += 1
-                    if cur_patience >= config.patience:
-                        lr /= 2.0
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] = lr
-                        if lr < config.init_lr * 1e-2:
-                            stop_train = True
-                            break
-                        cur_patience = 0
-        if stop_train: break
-    logging('best_dev_F1 {}'.format(best_dev_F1))
+            # with open('output.txt','w') as f:
+            #     f.write(str(pred))
+            # pickle.dump(pred, open("combine.p", "wb"))
+            # print('Here are the loss',)
+            # assert(1==0)
+            # # loss = (nll_sum())
+            # # optimizer.zero_grad()
+            # # loss.backward()
+            # # optimizer.step()
+            #
+            # total_loss += loss.data
+            # global_step += 1
+    #
+    #         if global_step % config.period == 0:
+    #             cur_loss = total_loss / config.period
+    #             elapsed = time.time() - start_time
+    #             logging('| epoch {:3d} | step {:6d} | lr {:05.5f} | ms/batch {:5.2f} | train loss {:8.3f}'.format(epoch, global_step, lr, elapsed*1000/config.period, cur_loss))
+    #             total_loss = 0
+    #             start_time = time.time()
+    #
+    #         if global_step % config.checkpoint == 0:
+    #             model.eval()
+    #             metrics = evaluate_batch(build_dev_iterator(), model, 0, dev_eval_file, config)
+    #             model.train()
+    #
+    #             logging('-' * 89)
+    #             logging('| eval {:6d} in epoch {:3d} | time: {:5.2f}s | dev loss {:8.3f} | EM {:.4f} | F1 {:.4f}'.format(global_step//config.checkpoint,
+    #                 epoch, time.time()-eval_start_time, metrics['loss'], metrics['exact_match'], metrics['f1']))
+    #             logging('-' * 89)
+    #
+    #             eval_start_time = time.time()
+    #
+    #             dev_F1 = metrics['f1']
+    #             if best_dev_F1 is None or dev_F1 > best_dev_F1:
+    #                 best_dev_F1 = dev_F1
+    #                 torch.save(ori_model.state_dict(), os.path.join(config.save, 'model.pt'))
+    #                 cur_patience = 0
+    #             else:
+    #                 cur_patience += 1
+    #                 if cur_patience >= config.patience:
+    #                     lr /= 2.0
+    #                     for param_group in optimizer.param_groups:
+    #                         param_group['lr'] = lr
+    #                     if lr < config.init_lr * 1e-2:
+    #                         stop_train = True
+    #                         break
+    #                     cur_patience = 0
+    #     if stop_train: break
+    # logging('best_dev_F1 {}'.format(best_dev_F1))
 
 def evaluate_batch(data_source, model, max_batches, eval_file, config):
     answer_dict = {}
@@ -182,7 +243,7 @@ def evaluate_batch(data_source, model, max_batches, eval_file, config):
         answer_dict_ = convert_tokens(eval_file, data['ids'], yp1.data.cpu().numpy().tolist(), yp2.data.cpu().numpy().tolist(), np.argmax(predict_type.data.cpu().numpy(), 1))
         answer_dict.update(answer_dict_)
 
-        total_loss += loss.data[0]
+        total_loss += loss.data
         step_cnt += 1
     loss = total_loss / step_cnt
     metrics = evaluate(eval_file, answer_dict)
@@ -219,6 +280,7 @@ def predict(data_source, model, eval_file, config, prediction_file):
             sp_dict.update({cur_id: cur_sp_pred})
 
     prediction = {'answer': answer_dict, 'sp': sp_dict}
+
     with open(prediction_file, 'w') as f:
         json.dump(prediction, f)
 
@@ -261,10 +323,10 @@ def test(config):
         return DataIterator(dev_buckets, config.batch_size, para_limit,
             ques_limit, config.char_limit, False, config.sent_limit)
 
-    if config.sp_lambda > 0:
-        model = SPModel(config, word_mat, char_mat)
-    else:
-        model = Model(config, word_mat, char_mat)
+    # if config.sp_lambda > 0:
+    #     model = SPModel(config, word_mat, char_mat)
+    # else:
+    model = Model(config, word_mat, char_mat)
     ori_model = model.cuda()
     ori_model.load_state_dict(torch.load(os.path.join(config.save, 'model.pt')))
     model = nn.DataParallel(ori_model)

@@ -10,6 +10,7 @@ import copy
 import ujson as json
 import traceback
 
+
 IGNORE_INDEX = -100
 
 RE_D = re.compile('\d')
@@ -115,6 +116,7 @@ class DataIterator(object):
 
             input_lengths = (context_idxs[:cur_bsz] > 0).long().sum(dim=1)
             max_c_len = int(input_lengths.max())
+            question_lens = (ques_idxs[:cur_bsz] > 0).long().sum(dim=1)
             max_q_len = int((ques_idxs[:cur_bsz] > 0).long().sum(dim=1).max())
 
             self.bkt_ptrs[bkt_id] += cur_bsz
@@ -126,6 +128,7 @@ class DataIterator(object):
                 'context_char_idxs': context_char_idxs[:cur_bsz, :max_c_len].contiguous(),
                 'ques_char_idxs': ques_char_idxs[:cur_bsz, :max_q_len].contiguous(),
                 'context_lens': input_lengths,
+                'question_lens': question_lens,
                 'y1': y1[:cur_bsz],
                 'y2': y2[:cur_bsz],
                 'ids': ids,

@@ -11,4 +11,4 @@ wget http://nlp.stanford.edu/data/glove.840B.300d.zip -O $GLOVE_DIR/glove.840B.3
 unzip $GLOVE_DIR/glove.840B.300d.zip -d $GLOVE_DIR
 
 # Download Spacy language models
-python3 -m spacy download en
+#python3 -m spacy download en
